@@ -2,9 +2,6 @@
 Virtual-Assistant-Answering-Navigation-Interacting-Robot for specially disabled children. Robot help them in there speech improvement and gives G.K. by interacting with the children's.
 If **VAANI** is your voice-assistant/robot project, you can use the following README template and modify it as needed.
 
-``markdown
-# VAANI – Voice Assisted AI Network Interface
-
 ## Overview
 VAANI is an intelligent voice-enabled assistant designed to provide real-time speech interaction, audio processing, and smart device control. The system captures user speech, converts it into text, processes the request using AI-based logic, and generates a spoken response.
 

@@ -1,0 +1,423 @@
+#include <driver/i2s.h>
+#include <WiFi.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <ESP32Servo.h>
+#include <AudioFileSourceHTTPStream.h>
+#include <AudioOutputI2S.h>
+#include <AudioGeneratorMP3.h>
+#include <WebSocketsClient.h>
+
+#define I2S_WS        25
+#define I2S_SD        32
+#define I2S_SCK       26
+#define I2S_MIC_PORT  I2S_NUM_0
+#define I2S_AUDIO_PORT I2S_NUM_1
+
+#define BUFFER_LEN    512
+#define CHUNK_SIZE    BUFFER_LEN
+#define MIN_CHUNKS    5
+#define MAX_CHUNKS    40
+
+#define TFT_BACKLIGHT 13
+
+int16_t sBuffer[BUFFER_LEN];
+uint8_t audioChunks[MAX_CHUNKS][CHUNK_SIZE];
+
+bool i2sDriverInstalled = false;
+bool i2sMicDriverInstalled = false;
+
+
+// WiFi credentials
+const char* ssid = "iQOO Z7 Pro 5G";
+const char* password = "12345679";
+
+// Audio objects
+AudioGeneratorMP3 *mp3 = nullptr;
+AudioFileSourceHTTPStream *file = nullptr;
+AudioOutputI2S *out = nullptr;
+
+// Display and Servo
+TFT_eSPI tft = TFT_eSPI();
+Servo rightHand;
+Servo leftHand;
+
+int COLOR_WHITE = TFT_WHITE;
+int COLOR_BLACK = TFT_BLACK;
+int COLOR_BLUE  = TFT_BLUE;
+
+int ref_eye_height      = 80;
+int ref_eye_width       = 80;
+int ref_space_between_eye = 20;
+int ref_corner_radius   = 20;
+
+int screen_width  = 320;
+int screen_height = 240;
+
+int eye_width         = ref_eye_width;
+int space_between_eyes= ref_space_between_eye;
+
+int center_x = screen_width / 2;
+int center_y = screen_height / 2;
+
+int left_eye_x  = center_x - eye_width / 2 - space_between_eyes / 2;
+int left_eye_y  = center_y;
+int right_eye_x = center_x + eye_width / 2 + space_between_eyes / 2;
+int right_eye_y = center_y;
+
+int corner_radius = ref_corner_radius;
+
+
+WebSocketsClient webSocket;
+
+const char* wsServer = "10.239.161.117";
+const uint16_t wsPort = 8888;
+
+volatile bool newAudioURL = false;
+String streamURL = "";
+
+void display_clearDisplay() {
+  tft.fillScreen(COLOR_BLACK);
+}
+
+void displayInit() {
+  tft.init();
+  tft.setRotation(3); // or your preferred rotation
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(4);
+}
+
+void display_fillRoundRect(int x, int y, int w, int h, int r, int color) {
+  tft.fillRoundRect(x, y, w, h, r, color);
+}
+
+void draw_eyes() {
+  display_clearDisplay();
+  display_fillRoundRect(left_eye_x - ref_eye_width/2,  left_eye_y - ref_eye_height/2,
+                        ref_eye_width, ref_eye_height, corner_radius, COLOR_BLUE);
+  display_fillRoundRect(right_eye_x - ref_eye_width/2, right_eye_y - ref_eye_height/2,
+                        ref_eye_width, ref_eye_height, corner_radius, COLOR_BLUE);
+}
+
+void blink(int speed = 12) {
+  for (int i = 0; i < 3; i++) {
+    ref_eye_height -= speed; draw_eyes(); delay(80);
+  }
+  for (int i = 0; i < 3; i++) {
+    ref_eye_height += speed; draw_eyes(); delay(80);
+  }
+}
+
+void waveHands(int times = 2) {
+  for (int i = 0; i < times; i++) {
+    rightHand.write(60); delay(1000);
+    leftHand.write(120); delay(1000);
+    rightHand.write(80); delay(1000);
+    leftHand.write(90); delay(1000);
+    blink();
+    rightHand.write(90); delay(1000);
+    leftHand.write(80); delay(1000);
+    rightHand.write(120); delay(1000);
+    leftHand.write(60); delay(1000);
+    blink();
+  }
+}
+
+// STOP Playback and uninstall audio I2S driver
+void stopPlayback() {
+  if (mp3) {
+    mp3->stop();
+    delete mp3;
+    mp3 = nullptr;
+  }
+  if (file) {
+    delete file;
+    file = nullptr;
+  }
+  if (out) {
+    out->stop();
+    delete out;
+    out = nullptr;
+  }
+
+  if (i2sDriverInstalled) {
+    i2s_driver_uninstall(I2S_AUDIO_PORT);
+    i2sDriverInstalled = false;
+  }
+  restoreBacklight();
+  displayInit();        // <== Add this line
+  draw_eyes(); 
+}
+
+
+void restoreBacklight() {
+  pinMode(TFT_BACKLIGHT, OUTPUT);
+  digitalWrite(TFT_BACKLIGHT, HIGH);
+}
+
+// START Playback and install audio I2S driver dynamically
+void startPlayback(const char* url) {
+  Serial.printf("[Audio] Starting playback for URL: %s\n", url);
+
+  if (i2sMicDriverInstalled) {
+    Serial.println("[Audio] Uninstalling I2S_MIC_PORT before starting playback");
+    i2s_stop(I2S_MIC_PORT);
+    i2s_driver_uninstall(I2S_MIC_PORT);
+    i2sMicDriverInstalled = false;
+    Serial.println("i2s driver uninstall");
+  }
+
+  stopPlayback();  // cleanup
+  
+file = new AudioFileSourceHTTPStream("http://10.30.114.117:8081/audio/bot_response.mp3");
+
+  i2s_config_t i2s_audio_cfg = {
+    .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = 44100,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 512,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0
+  };
+
+  i2s_pin_config_t i2s_audio_pins = {
+    .bck_io_num = 27,
+    .ws_io_num = 15,
+    .data_out_num = 13,
+    .data_in_num = -1
+  };
+
+  esp_err_t err = i2s_driver_install(I2S_AUDIO_PORT, &i2s_audio_cfg, 0, NULL);
+  if (err == ESP_OK) {
+    i2sDriverInstalled = true;
+    Serial.printf("[Audio] install i2s driver: %d\n");
+  } else {
+    Serial.printf("[Audio] Failed to install i2s driver: %d\n", err);
+    stopPlayback();
+    return;
+  }
+
+  i2s_set_pin(I2S_AUDIO_PORT, &i2s_audio_pins);
+  i2s_start(I2S_AUDIO_PORT);
+
+  out = new AudioOutputI2S(I2S_AUDIO_PORT);
+  out->SetOutputModeMono(true);
+  out->SetGain(1);
+
+  mp3 = new AudioGeneratorMP3();
+  bool started = mp3->begin(file, out);
+
+  Serial.printf("[Audio] MP3 begin returned: %s\n", started ? "true" : "false");
+  if (!started) {
+    Serial.println("[Audio] MP3 begin failed");
+    stopPlayback();
+  } else {
+    Serial.println("[Audio] MP3 playback started");
+  }
+}
+
+
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      Serial.println("[WS] Connected");
+      break;
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] Disconnected");
+      break;
+    case WStype_TEXT: {
+      String msg = String((char*)payload);
+      Serial.println("[WS] Text Received: " + msg);
+
+      if (msg.startsWith("AUDIO_URL:")) {
+        noInterrupts();
+        streamURL = msg.substring(strlen("AUDIO_URL:"));
+        streamURL.trim();
+        newAudioURL = true;
+        interrupts();
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void initWebSocket() {
+  webSocket.begin(wsServer, wsPort, "/");
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+  webSocket.enableHeartbeat(15000, 3000, 2);
+}
+
+void connectWiFi() {
+  Serial.printf("Connecting to %s", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.println("IP: " + WiFi.localIP().toString());
+}
+
+void micTask(void* parameter) {
+  pinMode(4, INPUT_PULLDOWN);
+
+  while (true) {
+    if (digitalRead(4) == HIGH) {
+      Serial.println("[MicTask] Start capturing...");
+
+      // Install and configure I2S for MIC_PORT dynamically
+      i2s_config_t i2s_mic_cfg = {
+        .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+        .intr_alloc_flags = 0,
+        .dma_buf_count = 8,
+        .dma_buf_len = BUFFER_LEN,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+      };
+
+      i2s_pin_config_t i2s_mic_pins = {
+        .bck_io_num = I2S_SCK,
+        .ws_io_num = I2S_WS,
+        .data_out_num = -1,
+        .data_in_num = I2S_SD
+      };
+
+      esp_err_t err = i2s_driver_install(I2S_MIC_PORT, &i2s_mic_cfg, 0, NULL);
+      if (err != ESP_OK) {
+        Serial.printf("[MicTask] Failed to install I2S driver: %d\n", err);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        continue;
+      }
+
+      i2s_set_pin(I2S_MIC_PORT, &i2s_mic_pins);
+      i2s_start(I2S_MIC_PORT);
+      i2sMicDriverInstalled = true;
+
+      int chunkIndex = 0;
+      size_t bytesRead = 0;
+
+      while (digitalRead(4) == HIGH && chunkIndex < MAX_CHUNKS) {
+        err = i2s_read(I2S_MIC_PORT, audioChunks[chunkIndex], CHUNK_SIZE, &bytesRead, portMAX_DELAY);
+        if (err == ESP_OK && bytesRead > 0) {
+          // === Apply Digital Gain ===
+          int16_t* samples = (int16_t*)audioChunks[chunkIndex];
+          size_t sampleCount = bytesRead / sizeof(int16_t);
+          float gain = 3.5; // 🔥 Adjust this to boost mic input (e.g., 2.0 to 4.0)
+
+          for (size_t i = 0; i < sampleCount; ++i) {
+            int32_t amplified = (int32_t)(samples[i] * gain);
+            if (amplified > INT16_MAX) amplified = INT16_MAX;
+            if (amplified < INT16_MIN) amplified = INT16_MIN;
+            samples[i] = (int16_t)amplified;
+          }
+
+          if (webSocket.isConnected()) {
+            bool sent = webSocket.sendBIN(audioChunks[chunkIndex], bytesRead);
+            Serial.printf("[MicTask] Sent chunk %d: %s\n", chunkIndex, sent ? "OK" : "Fail");
+            delay(10);
+          } else {
+            Serial.println("[MicTask] WebSocket not connected");
+            break;
+          }
+
+          chunkIndex++;
+        }
+      }
+
+      Serial.println("[MicTask] Done sending chunks");
+
+      i2s_stop(I2S_MIC_PORT);
+      i2s_driver_uninstall(I2S_MIC_PORT);
+      i2sMicDriverInstalled = false;
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+
+void speakerTask(void* parameter) {
+  while (true) {
+    if (newAudioURL) {
+      noInterrupts();
+      String url = streamURL;
+      newAudioURL = false;
+      interrupts();
+
+      startPlayback(url.c_str());
+    }
+
+    if (mp3 && mp3->isRunning()) {
+      if (!mp3->loop()) {
+        Serial.println("[Audio] Playback finished");
+        stopPlayback();
+      }
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  connectWiFi();
+
+   tft.init();
+  tft.setRotation(3); // Adjust as needed
+  tft.fillScreen(TFT_BLACK);
+
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(4);
+
+  const char* text = "V.A.A.N.I";
+
+  int charWidth = 6; // Default font is ~6 px wide
+  int textLength = strlen(text);
+  int textWidth = charWidth * textLength * 3; // size 3 text
+
+  int screenWidth = tft.width();  // e.g. 320
+  int screenHeight = tft.height(); // e.g. 240
+
+  int x = (screenWidth - textWidth) / 3;
+  int y = (screenHeight - (8 * 3)) / 2;  // 8 is base font height
+
+  tft.setCursor(x, y);
+  tft.println(text);
+
+  delay(3000);
+  rightHand.attach(16);
+  leftHand.attach(17);
+
+  draw_eyes();
+
+  initWebSocket();
+
+  xTaskCreatePinnedToCore(micTask, "Mic Task", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(speakerTask, "Speaker Task", 8192, NULL, 1, NULL, 1);
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Disconnected. Attempting reconnection...");
+    connectWiFi();
+  }
+
+  webSocket.loop();
+  delay(10);
+}
